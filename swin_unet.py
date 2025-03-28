@@ -5,13 +5,11 @@
 #
 #
 
-
-
-
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from keras_unet_collection.transformer_layers import patch_merging, patch_expanding
-from tensorflow.keras.layers import Layer, Dense
+from tensorflow.keras.layers import Layer, Dense, LayerNormalization, Dropout
+
 
 # Custom PatchMerging and PatchExpanding classes
 class CustomPatchMerging(Layer):
@@ -79,12 +77,94 @@ class PatchEmbedding(layers.Layer):
         return self.dense(inputs)
 
 
-class SwinTransformerBlock(layers.Layer):
-    def __init__(self, dim, num_patch, num_heads, window_size, shift_size, num_mlp, qkv_bias, qk_scale, mlp_drop, attn_drop, proj_drop, drop_path_prob, name=""):
-        super(SwinTransformerBlock, self).__init__(name=name)
+class WindowMultiHeadSelfAttention(Layer):
+    def __init__(self, dim, num_heads, window_size, qkv_bias=True, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = dim  
+        self.num_heads = num_heads  
+        self.window_size = window_size  
+        self.scale = (dim // num_heads) ** -0.5  
+
+        self.qkv = Dense(dim * 3, use_bias=qkv_bias)
+        self.proj = Dense(dim)
+
+    def call(self, x):
+        B, H, W, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], self.dim  
+        x = tf.reshape(x, (B, H * W, C))  
+
+        # Q, K, V aufteilen
+        qkv = self.qkv(x)  
+        qkv = tf.reshape(qkv, (B, H * W, 3, self.num_heads, C // self.num_heads))
+        q, k, v = tf.unstack(qkv, axis=2)
+
+        # Skaliertes Dot-Produkt Self Attention
+        attn_scores = tf.matmul(q, k, transpose_b=True) * self.scale
+        attn_weights = tf.nn.softmax(attn_scores, axis=-1)
+
+        # Anwenden auf Werte
+        attn_output = tf.matmul(attn_weights, v)
+
+        # Rückprojektieren
+        attn_output = tf.reshape(attn_output, (B, H * W, C))
+        attn_output = self.proj(attn_output)
+
+        return attn_output
+
+
+
+class SwinTransformerBlock(Layer):
+    def __init__(self, dim, num_patch, num_heads, window_size, shift_size, num_mlp, qkv_bias=True,qk_scale=None, mlp_drop=None,attn_drop=None, proj_drop=None, drop_path_prob=None, drop_rate=0.0, **kwargs):
+        super(SwinTransformerBlock, self).__init__(**kwargs)
+        self.dim = dim  
+        self.num_patch = num_patch  
+        self.num_heads = num_heads  
+        self.window_size = window_size  
+        self.shift_size = shift_size  
+        self.num_mlp = num_mlp  
+        self.qkv_bias = qkv_bias  
+        self.qk_scale = qk_scale  
+        self.drop_rate = drop_rate  
+        self.mlp_drop = mlp_drop
+        self.attn_drop = attn_drop
+        self.proj_drop = proj_drop
+        self.drop_path_prob = drop_path_prob
+
+        # Layer Normalization
+        self.norm1 = LayerNormalization(epsilon=1e-6)
+        self.norm2 = LayerNormalization(epsilon=1e-6)
+
+        # MSA mit Fensterung
+        self.attn = WindowMultiHeadSelfAttention(dim, num_heads, window_size, qkv_bias)
+
+        # MLP Feedforward
+        self.mlp = tf.keras.Sequential([
+            Dense(num_mlp * dim, activation="gelu"),  
+            Dropout(drop_rate),
+            Dense(dim),  
+            Dropout(drop_rate)
+        ])
 
     def call(self, inputs):
-        return inputs
+        shortcut = inputs  # Original Input Shape: (B, H, W, C)
+        B, H, W, C = tf.shape(inputs)[0], tf.shape(inputs)[1], tf.shape(inputs)[2], tf.shape(inputs)[3]
+        
+        # LayerNorm + Multi-Head Attention (Self Attention)
+        x = self.norm1(inputs)
+        x = self.attn(x)  # Hier wird der Multi-Head Attention Layer angewendet
+        x = tf.reshape(x, tf.shape(shortcut)) 
+        # Residual Connection (shortcut + x)
+        x = shortcut + x  # Residual Connection
+
+        # LayerNorm + MLP Feedforward
+        x = self.norm2(x)
+        x = self.mlp(x)
+
+        assert x.shape == shortcut.shape, f"Formen stimmen nicht überein: x={x.shape}, shortcut={shortcut.shape}"
+
+        x = shortcut + x  # Residual Connection
+        return x
+
+
 
 
 def swin_transformer_stack(X, stack_num, embed_dim, num_patch, num_heads, window_size, num_mlp, shift_window=True, name=''):
@@ -208,7 +288,6 @@ def swin_unet_2d(input_size, filter_num_begin, n_labels, depth, stack_num_down, 
     
     return model
 
-
 model = swin_unet_2d(
     input_size=(512, 512, 3), 
     filter_num_begin=512, 
@@ -218,10 +297,11 @@ model = swin_unet_2d(
     stack_num_up=4, 
     patch_size=(8, 8), 
     num_heads=[4, 8, 16, 16],  
-    window_size=[16, 8, 4, 4],  
+    window_size=[64, 64, 16, 16],  
     num_mlp=2, 
     output_activation='sigmoid', 
     shift_window=True, 
     name='swin_unet'
 )
+model.build(input_shape=(None, 512, 512, 3)) 
 model.summary()
